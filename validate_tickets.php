@@ -1,4 +1,4 @@
-<?php
+ <?php
 // =====================================================
 // validate_tickets.php - Ticket Quantity Validation
 // REQUIREMENT 4: Validate ticket quantities, prevent overselling
@@ -11,114 +11,76 @@ require_once 'db.php';
 // Core validation function for Requirement 4.
 // Checks:
 //   (a) quantity > 0
-//   (b) quantity <= max_per_order (per-order cap)
-//   (c) quantity <= tickets_available (oversell guard)
+//   (b) quantity does not exceed available stock
+//       available = ticket_types.quantity - SUM of registrations for that ticket
 //
-// Returns an associative array:
-//   ['valid' => bool, 'errors' => string[], 'line_items' => array]
+// Returns: ['valid' => bool, 'errors' => string[], 'ticket' => array|null]
 // -------------------------------------------------------
-function validateTicketOrder(array $selections, int $eventId): array {
+function validateTicketOrder(int $ticketId, int $qty): array {
     $conn   = getDBConnection();
     $errors = [];
-    $lineItems = [];
 
-    // Reject entirely empty cart
-    $totalQty = array_sum($selections);
-    if ($totalQty === 0) {
-        $errors[] = 'Please select at least one ticket before proceeding.';
-        return ['valid' => false, 'errors' => $errors, 'line_items' => []];
+    // --- (a) Zero or negative quantity check ---
+    if ($qty <= 0) {
+        $errors[] = 'Please select at least 1 ticket.';
+        return ['valid' => false, 'errors' => $errors, 'ticket' => null];
     }
 
-    foreach ($selections as $ticketTypeId => $qty) {
-        $qty          = (int) $qty;
-        $ticketTypeId = (int) $ticketTypeId;
+    // Fetch ticket type details
+    // SELECT ... FOR UPDATE locks the row to prevent concurrent overselling
+    $stmt = $conn->prepare(
+        "SELECT tt.ticket_id, tt.type, tt.price, tt.quantity, tt.event_id,
+                COALESCE(SUM(r.quantity), 0) AS tickets_sold
+         FROM ticket_types tt
+         LEFT JOIN registrations r ON r.ticket_id = tt.ticket_id
+         WHERE tt.ticket_id = ?
+         GROUP BY tt.ticket_id
+         FOR UPDATE"
+    );
+    $stmt->bind_param('i', $ticketId);
+    $stmt->execute();
+    $result = $stmt->get_result();
 
-        if ($qty === 0) continue; // skip unselected types
-
-        // --- (a) Negative / zero quantity check ---
-        if ($qty < 0) {
-            $errors[] = "Ticket quantity cannot be negative.";
-            continue;
-        }
-
-        // Fetch live ticket data with a row lock to prevent race conditions
-        // (SELECT ... FOR UPDATE inside a transaction prevents overselling
-        //  under concurrent requests)
-        $stmt = $conn->prepare(
-            "SELECT type_name, price, total_capacity, tickets_sold, max_per_order
-             FROM ticket_types
-             WHERE ticket_type_id = ? AND event_id = ?
-             FOR UPDATE"
-        );
-        $stmt->bind_param('ii', $ticketTypeId, $eventId);
-        $stmt->execute();
-        $result = $stmt->get_result();
-
-        if ($result->num_rows === 0) {
-            $errors[] = "Ticket type ID $ticketTypeId is invalid or does not belong to this event.";
-            $stmt->close();
-            continue;
-        }
-
-        $ticket    = $result->fetch_assoc();
-        $available = $ticket['total_capacity'] - $ticket['tickets_sold'];
+    if ($result->num_rows === 0) {
+        $errors[] = 'Invalid ticket type selected.';
         $stmt->close();
-
-        // --- (b) Per-order maximum check ---
-        if ($qty > $ticket['max_per_order']) {
-            $errors[] = sprintf(
-                '"%s" tickets: You requested %d but the maximum per order is %d.',
-                $ticket['type_name'], $qty, $ticket['max_per_order']
-            );
-        }
-
-        // --- (c) Overselling prevention ---
-        if ($qty > $available) {
-            if ($available === 0) {
-                $errors[] = sprintf(
-                    '"%s" tickets are SOLD OUT. Please choose a different ticket type.',
-                    $ticket['type_name']
-                );
-            } else {
-                $errors[] = sprintf(
-                    '"%s" tickets: Only %d ticket(s) remaining but you requested %d.',
-                    $ticket['type_name'], $available, $qty
-                );
-            }
-        }
-
-        // Build line item even if there are errors (for UI feedback)
-        $lineItems[] = [
-            'ticket_type_id' => $ticketTypeId,
-            'type_name'      => $ticket['type_name'],
-            'qty'            => $qty,
-            'unit_price'     => $ticket['price'],
-            'subtotal'       => $ticket['price'] * $qty,
-            'available'      => $available,
-            'max_per_order'  => $ticket['max_per_order'],
-        ];
+        $conn->close();
+        return ['valid' => false, 'errors' => $errors, 'ticket' => null];
     }
 
+    $ticket    = $result->fetch_assoc();
+    $available = $ticket['quantity'] - $ticket['tickets_sold'];
+    $stmt->close();
     $conn->close();
 
+    // --- (b) Overselling prevention ---
+    if ($available <= 0) {
+        $errors[] = '"' . $ticket['type'] . '" tickets are SOLD OUT.';
+    } elseif ($qty > $available) {
+        $errors[] = '"' . $ticket['type'] . '" tickets: Only ' . $available .
+                    ' ticket(s) remaining but you requested ' . $qty . '.';
+    }
+
+    $ticket['available'] = $available;
+
     return [
-        'valid'      => empty($errors),
-        'errors'     => $errors,
-        'line_items' => $lineItems,
+        'valid'  => empty($errors),
+        'errors' => $errors,
+        'ticket' => $ticket,
     ];
 }
 
 // -------------------------------------------------------
 // validateAttendeeInfo()
 // Validates personal details submitted on the booking form.
-// Returns ['valid' => bool, 'errors' => string[], 'data' => array]
+// Returns: ['valid' => bool, 'errors' => string[], 'data' => array]
 // -------------------------------------------------------
 function validateAttendeeInfo(array $post): array {
     $errors = [];
     $data   = [];
 
     // Full name
-    $name = trim($post['full_name'] ?? '');
+    $name = trim($post['name'] ?? '');
     if ($name === '') {
         $errors[] = 'Full name is required.';
     } elseif (strlen($name) < 3) {
@@ -126,7 +88,7 @@ function validateAttendeeInfo(array $post): array {
     } elseif (!preg_match('/^[a-zA-Z\s\'\-]+$/', $name)) {
         $errors[] = 'Full name may only contain letters, spaces, hyphens, and apostrophes.';
     } else {
-        $data['full_name'] = $name;
+        $data['name'] = $name;
     }
 
     // Email
@@ -139,25 +101,16 @@ function validateAttendeeInfo(array $post): array {
         $data['email'] = $email;
     }
 
-    // Phone (Kenyan format, optional but validated if provided)
+    // Phone (optional but validated if provided)
     $phone = trim($post['phone'] ?? '');
     if ($phone !== '') {
         if (!preg_match('/^(\+254|0)[17]\d{8}$/', $phone)) {
-            $errors[] = 'Phone number must be a valid Kenyan number (e.g. 0712345678).';
+            $errors[] = 'Phone must be a valid Kenyan number (e.g. 0712345678).';
         } else {
             $data['phone'] = $phone;
         }
     } else {
         $data['phone'] = null;
-    }
-
-    // Payment method
-    $allowed = ['mpesa', 'card', 'cash'];
-    $method  = $post['payment_method'] ?? '';
-    if (!in_array($method, $allowed, true)) {
-        $errors[] = 'Please select a valid payment method.';
-    } else {
-        $data['payment_method'] = $method;
     }
 
     return [
@@ -169,52 +122,54 @@ function validateAttendeeInfo(array $post): array {
 
 // -------------------------------------------------------
 // reserveTickets()
-// Atomically reserves tickets inside a transaction.
-// Uses SELECT ... FOR UPDATE to prevent race conditions.
-// Returns ['success' => bool, 'registration_id' => int|null, 'error' => string]
+// Atomically saves registration + payment inside a transaction.
+// Uses SELECT ... FOR UPDATE to prevent concurrent overselling.
+// Returns: ['success' => bool, 'registration_id' => int|null, 'error' => string]
 // -------------------------------------------------------
-function reserveTickets(int $eventId, array $lineItems, array $attendeeData, string $paymentMethod): array {
+function reserveTickets(int $eventId, int $ticketId, int $qty, float $unitPrice, array $attendeeData): array {
     $conn = getDBConnection();
     $conn->begin_transaction();
 
     try {
-        // 1. Re-validate availability inside the transaction (double-check)
-        foreach ($lineItems as $item) {
-            $stmt = $conn->prepare(
-                "SELECT total_capacity, tickets_sold FROM ticket_types
-                 WHERE ticket_type_id = ? FOR UPDATE"
-            );
-            $stmt->bind_param('i', $item['ticket_type_id']);
-            $stmt->execute();
-            $row       = $stmt->get_result()->fetch_assoc();
-            $available = $row['total_capacity'] - $row['tickets_sold'];
-            $stmt->close();
+        // Re-check availability inside transaction (guards against race conditions)
+        $stmt = $conn->prepare(
+            "SELECT tt.quantity,
+                    COALESCE(SUM(r.quantity), 0) AS tickets_sold
+             FROM ticket_types tt
+             LEFT JOIN registrations r ON r.ticket_id = tt.ticket_id
+             WHERE tt.ticket_id = ?
+             GROUP BY tt.ticket_id
+             FOR UPDATE"
+        );
+        $stmt->bind_param('i', $ticketId);
+        $stmt->execute();
+        $row       = $stmt->get_result()->fetch_assoc();
+        $available = $row['quantity'] - $row['tickets_sold'];
+        $stmt->close();
 
-            if ($item['qty'] > $available) {
-                throw new RuntimeException(
-                    "Sorry, ticket availability changed for \"{$item['type_name']}\". " .
-                    "Only $available left. Please adjust your order."
-                );
-            }
+        if ($qty > $available) {
+            throw new RuntimeException(
+                'Sorry, only ' . $available . ' ticket(s) left. Please adjust your order.'
+            );
         }
 
-        // 2. Insert or find attendee
+        // Insert or find existing attendee by email
         $stmt = $conn->prepare(
             "SELECT attendee_id FROM attendees WHERE email = ? LIMIT 1"
         );
         $stmt->bind_param('s', $attendeeData['email']);
         $stmt->execute();
-        $existingAttendee = $stmt->get_result()->fetch_assoc();
+        $existing = $stmt->get_result()->fetch_assoc();
         $stmt->close();
 
-        if ($existingAttendee) {
-            $attendeeId = $existingAttendee['attendee_id'];
+        if ($existing) {
+            $attendeeId = $existing['attendee_id'];
         } else {
             $stmt = $conn->prepare(
-                "INSERT INTO attendees (full_name, email, phone) VALUES (?, ?, ?)"
+                "INSERT INTO attendees (name, email, phone) VALUES (?, ?, ?)"
             );
             $stmt->bind_param('sss',
-                $attendeeData['full_name'],
+                $attendeeData['name'],
                 $attendeeData['email'],
                 $attendeeData['phone']
             );
@@ -223,52 +178,22 @@ function reserveTickets(int $eventId, array $lineItems, array $attendeeData, str
             $stmt->close();
         }
 
-        // 3. Calculate total
-        $total = array_sum(array_column($lineItems, 'subtotal'));
-
-        // 4. Create registration record
+        // Create registration record
         $stmt = $conn->prepare(
-            "INSERT INTO registrations (attendee_id, event_id, total_amount, status)
-             VALUES (?, ?, ?, 'confirmed')"
+            "INSERT INTO registrations (attendee_id, event_id, ticket_id, quantity)
+             VALUES (?, ?, ?, ?)"
         );
-        $stmt->bind_param('iid', $attendeeId, $eventId, $total);
+        $stmt->bind_param('iiii', $attendeeId, $eventId, $ticketId, $qty);
         $stmt->execute();
         $registrationId = $conn->insert_id;
         $stmt->close();
 
-        // 5. Insert line items and decrement tickets_sold
-        foreach ($lineItems as $item) {
-            // Insert item
-            $stmt = $conn->prepare(
-                "INSERT INTO registration_items (registration_id, ticket_type_id, quantity, unit_price)
-                 VALUES (?, ?, ?, ?)"
-            );
-            $stmt->bind_param('iiid',
-                $registrationId,
-                $item['ticket_type_id'],
-                $item['qty'],
-                $item['unit_price']
-            );
-            $stmt->execute();
-            $stmt->close();
-
-            // Decrement available count
-            $stmt = $conn->prepare(
-                "UPDATE ticket_types SET tickets_sold = tickets_sold + ?
-                 WHERE ticket_type_id = ?"
-            );
-            $stmt->bind_param('ii', $item['qty'], $item['ticket_type_id']);
-            $stmt->execute();
-            $stmt->close();
-        }
-
-        // 6. Simulate payment record
-        $txRef = strtoupper(substr($paymentMethod, 0, 3)) . date('YmdHis') . rand(10, 99);
+        // Simulate payment record
+        $total = $unitPrice * $qty;
         $stmt  = $conn->prepare(
-            "INSERT INTO payments (registration_id, amount, payment_method, transaction_ref, status)
-             VALUES (?, ?, ?, ?, 'completed')"
+            "INSERT INTO payments (registration_id, amount, status) VALUES (?, ?, 'Completed')"
         );
-        $stmt->bind_param('idss', $registrationId, $total, $paymentMethod, $txRef);
+        $stmt->bind_param('id', $registrationId, $total);
         $stmt->execute();
         $stmt->close();
 
